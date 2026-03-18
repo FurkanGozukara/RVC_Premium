@@ -49,6 +49,11 @@ import logging
 import uuid
 
 
+class _DropBelowError(logging.Filter):
+    def filter(self, record):
+        return record.levelno >= logging.ERROR
+
+
 def configure_logging():
     formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
     root = logging.getLogger()
@@ -86,6 +91,10 @@ def configure_logging():
     ]
     for name in noisy_loggers:
         logging.getLogger(name).setLevel(logging.ERROR)
+
+    pil_image_logger = logging.getLogger("PIL.Image")
+    pil_image_logger.setLevel(logging.ERROR)
+    pil_image_logger.addFilter(_DropBelowError())
 
 
 configure_logging()
@@ -155,7 +164,7 @@ os.makedirs(os.path.join(now_dir, "assets", "weights"), exist_ok=True)
 os.environ["TEMP"] = tmp
 warnings.filterwarnings("ignore")
 if hasattr(torch.backends, "nnpack"):
-    torch.backends.nnpack.enabled = False
+    torch.backends.nnpack.set_flags(False)
 torch.manual_seed(114514)
 
 
