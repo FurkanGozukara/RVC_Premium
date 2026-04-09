@@ -2,6 +2,8 @@
 
 ## Get the app installer zip file from here : https://www.patreon.com/posts/149104996
 
+### Tutorial Video : https://youtu.be/ZRrzvD4wNys
+
 Latest installer zip file : [**RVC_Installer.zip**](https://www.patreon.com/posts/149104996)
 
 - This app was requested so I found the most up to date fork and forked and improved it
