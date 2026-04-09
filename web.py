@@ -1,5 +1,6 @@
 import os
 import sys
+from collections import Counter
 from dotenv import load_dotenv
 
 now_dir = os.getcwd()
@@ -27,6 +28,7 @@ from infer.lib.train.process_ckpt import (
     change_info,
     extract_small_model,
     merge,
+    merge_many,
 )
 from i18n.i18n import I18nAuto
 from configs import Config
@@ -46,6 +48,7 @@ import traceback
 import threading
 import shutil
 import logging
+import re
 import uuid
 
 
@@ -268,6 +271,7 @@ outside_index_root = os.getenv("outside_index_root")
 
 names = [""]
 index_paths = [""]
+MERGE_MODEL_METADATA_CACHE = {}
 
 
 def lookup_names(weight_root):
@@ -327,6 +331,7 @@ AUDIO_FILE_EXTENSIONS = {
 }
 TRANSPOSE_MIN = -24
 TRANSPOSE_MAX = 24
+MAX_MERGED_INDEX_VECTORS = 200000
 
 
 def _normalize_transpose_value(value, default=0):
@@ -542,6 +547,78 @@ def _available_model_names():
     return sorted(name for name in names if str(name).strip())
 
 
+def _refresh_model_name_cache():
+    global names
+    names = [""]
+    lookup_names(weight_root)
+    MERGE_MODEL_METADATA_CACHE.clear()
+    return sorted(names)
+
+
+def _refresh_index_path_cache():
+    global index_paths
+    index_paths = [""]
+    lookup_indices(index_root)
+    lookup_indices(outside_index_root)
+    return sorted(index_paths)
+
+
+def _normalize_index_path_value(path_value):
+    normalized = _strip_path_value(path_value)
+    if not normalized:
+        return ""
+    return str(pathlib.Path(normalized))
+
+
+def _build_index_dropdown_update(index_update=None, current_value="", index_choices=None):
+    if index_choices is None:
+        index_choices = _refresh_index_path_cache()
+    normalized_choice_map = {
+        _normalize_index_path_value(choice): choice for choice in index_choices
+    }
+    update_payload = {}
+    if isinstance(index_update, dict):
+        update_payload = {
+            key: value for key, value in index_update.items() if key != "__type__"
+        }
+    requested_value = normalized_choice_map.get(
+        _normalize_index_path_value(update_payload.get("value", "")),
+        "",
+    )
+    fallback_value = normalized_choice_map.get(
+        _normalize_index_path_value(current_value),
+        "",
+    )
+    selected_value = requested_value or fallback_value or ""
+    update_payload["choices"] = index_choices
+    update_payload["value"] = selected_value
+    return gr.update(**update_payload)
+
+
+def refresh_infer_model_and_index_choices(selected_model_name, selected_index_path):
+    model_choices = _refresh_model_name_cache()
+    index_choices = _refresh_index_path_cache()
+    selected_model_name = str(selected_model_name or "").strip()
+    return (
+        gr.update(
+            choices=model_choices,
+            value=selected_model_name if selected_model_name in model_choices else "",
+        ),
+        _build_index_dropdown_update(
+            {"value": selected_index_path},
+            current_value=selected_index_path,
+            index_choices=index_choices,
+        ),
+    )
+
+
+def refresh_batch_index_choices(selected_index_path):
+    return _build_index_dropdown_update(
+        {"value": selected_index_path},
+        current_value=selected_index_path,
+    )
+
+
 def _resolve_model_names_for_conversion(selected_model_name, loop_all_models):
     available_models = _available_model_names()
     if loop_all_models:
@@ -570,6 +647,733 @@ def _resolve_output_audio_format(save_as_mp3):
 
 def toggle_mp3_bitrate_visibility(save_as_mp3):
     return gr.update(visible=bool(save_as_mp3))
+
+
+def _resolve_selected_voice_model_path(model_name):
+    model_name = str(model_name or "").strip()
+    if not model_name:
+        raise ValueError("Please select a voice model.")
+    model_path = pathlib.Path(weight_root) / model_name
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            f"Voice model '{model_name}' was not found in assets/weights."
+        )
+    return model_name, str(model_path)
+
+
+def _normalize_model_sr_label(value, config=None):
+    sr_lookup = {
+        32000: "32k",
+        40000: "40k",
+        48000: "48k",
+    }
+    if isinstance(value, str):
+        value = value.strip()
+        if value in sr_lookup.values():
+            return value
+    try:
+        sr_value = int(value)
+    except (TypeError, ValueError):
+        sr_value = None
+    if sr_value in sr_lookup:
+        return sr_lookup[sr_value]
+    if isinstance(config, (list, tuple)) and config:
+        try:
+            config_sr = int(config[-1])
+        except (TypeError, ValueError):
+            config_sr = None
+        if config_sr in sr_lookup:
+            return sr_lookup[config_sr]
+    return None
+
+
+def _normalize_model_f0_flag(value):
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return 1
+        if normalized in {"0", "false", "no"}:
+            return 0
+    try:
+        return 1 if int(value) else 0
+    except (TypeError, ValueError):
+        return 1
+
+
+def _expected_feature_dimension_for_version(version):
+    return 256 if str(version or "v1").strip().lower() == "v1" else 768
+
+
+def _load_merge_model_metadata(model_name):
+    model_name, model_path = _resolve_selected_voice_model_path(model_name)
+    checkpoint = torch.load(model_path, map_location="cpu")
+    config_value = checkpoint.get("config") or []
+    sr_label = _normalize_model_sr_label(checkpoint.get("sr"), config_value)
+    if not sr_label:
+        raise ValueError(f"Could not determine the sample rate for '{model_name}'.")
+    version_value = str(checkpoint.get("version") or "v1").strip().lower()
+    if version_value not in {"v1", "v2"}:
+        version_value = "v1"
+    weights = checkpoint["model"] if "model" in checkpoint else checkpoint.get("weight")
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError(f"Voice model '{model_name}' does not contain mergeable weights.")
+    return {
+        "name": model_name,
+        "path": model_path,
+        "checkpoint": checkpoint,
+        "weights": weights,
+        "sr": sr_label,
+        "f0": _normalize_model_f0_flag(checkpoint.get("f0", 1)),
+        "version": version_value,
+    }
+
+
+def _load_cached_merge_model_metadata(model_name, force_refresh=False):
+    model_name, model_path = _resolve_selected_voice_model_path(model_name)
+    stat_result = os.stat(model_path)
+    cache_key = (model_path, stat_result.st_mtime_ns, stat_result.st_size)
+    cached = MERGE_MODEL_METADATA_CACHE.get(model_name)
+    if not force_refresh and cached and cached.get("cache_key") == cache_key:
+        return cached["metadata"]
+    metadata = _load_merge_model_metadata(model_name)
+    MERGE_MODEL_METADATA_CACHE[model_name] = {
+        "cache_key": cache_key,
+        "metadata": metadata,
+    }
+    return metadata
+
+
+def _load_merge_index_metadata(model_name, expected_dimension):
+    index_path = _strip_path_value(get_index_path_from_model(model_name))
+    if not index_path:
+        return None
+    if not os.path.isfile(index_path):
+        raise FileNotFoundError(
+            f"Feature index for '{model_name}' was not found at '{index_path}'."
+        )
+    index = faiss.read_index(index_path)
+    if int(index.d) != int(expected_dimension):
+        raise ValueError(
+            f"Feature index for '{model_name}' has dimension {index.d}, "
+            f"expected {expected_dimension}."
+        )
+    return {
+        "name": model_name,
+        "path": index_path,
+        "index": index,
+        "dimension": int(index.d),
+        "ntotal": int(index.ntotal),
+    }
+
+
+def _validate_mergeable_voice_models(model_a, model_b):
+    if model_a["sr"] != model_b["sr"]:
+        raise ValueError(
+            "Selected voice models use different sample rates "
+            f"({model_a['sr']} vs {model_b['sr']})."
+        )
+    if model_a["f0"] != model_b["f0"]:
+        raise ValueError(
+            "Selected voice models disagree on pitch-guidance support "
+            f"({model_a['f0']} vs {model_b['f0']})."
+        )
+    if model_a["version"] != model_b["version"]:
+        raise ValueError(
+            "Selected voice models use different architecture versions "
+            f"({model_a['version']} vs {model_b['version']})."
+        )
+
+    weights_a = model_a["weights"]
+    weights_b = model_b["weights"]
+    if sorted(weights_a.keys()) != sorted(weights_b.keys()):
+        raise ValueError(
+            "Selected voice models use different parameter sets and cannot be merged."
+        )
+
+    for key in weights_a.keys():
+        shape_a = tuple(weights_a[key].shape)
+        shape_b = tuple(weights_b[key].shape)
+        if key == "emb_g.weight":
+            if shape_a[1:] != shape_b[1:]:
+                raise ValueError(
+                    "Selected voice models have incompatible speaker embedding shapes "
+                    f"for '{key}': {shape_a} vs {shape_b}."
+                )
+            continue
+        if shape_a != shape_b:
+            raise ValueError(
+                f"Selected voice models have incompatible tensor shapes for '{key}': "
+                f"{shape_a} vs {shape_b}."
+            )
+
+
+def _normalize_merge_model_selection(model_names):
+    if model_names is None:
+        return []
+    if isinstance(model_names, (str, bytes)):
+        model_names = [model_names]
+    normalized = []
+    seen = set()
+    for model_name in model_names:
+        normalized_name = str(model_name or "").strip()
+        if not normalized_name:
+            continue
+        if normalized_name in seen:
+            raise ValueError(
+                f"Voice model '{normalized_name}' was selected more than once."
+            )
+        seen.add(normalized_name)
+        normalized.append(normalized_name)
+    return normalized
+
+
+def _parse_merge_weights(weight_text, model_count):
+    model_count = int(model_count)
+    if model_count < 2:
+        raise ValueError("Please select at least two voice models to merge.")
+    raw_text = str(weight_text or "").strip()
+    if not raw_text:
+        return [1.0 / model_count] * model_count
+
+    tokens = [
+        token
+        for token in re.split(r"[\s,;]+", raw_text.replace("\n", " ").strip())
+        if token
+    ]
+    if len(tokens) != model_count:
+        raise ValueError(
+            f"Expected {model_count} weight values, but received {len(tokens)}."
+        )
+
+    weights = []
+    for token in tokens:
+        is_percent = token.endswith("%")
+        numeric_token = token[:-1] if is_percent else token
+        try:
+            value = float(numeric_token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid weight value '{token}'.") from exc
+        if is_percent:
+            value /= 100.0
+        if value < 0:
+            raise ValueError("Weights must be non-negative.")
+        weights.append(value)
+
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        raise ValueError("At least one merge weight must be greater than zero.")
+    return [value / total_weight for value in weights]
+
+
+def _validate_mergeable_voice_model_group(models):
+    if len(models) < 2:
+        raise ValueError("Please select at least two voice models to merge.")
+    reference_model = models[0]
+    for current_model in models[1:]:
+        _validate_mergeable_voice_models(reference_model, current_model)
+
+
+def _calculate_weighted_index_sample_counts(totals, weights, max_vectors):
+    totals = [max(0, int(total)) for total in totals]
+    max_vectors = max(1, int(max_vectors))
+    if len(totals) != len(weights):
+        raise ValueError("Index totals and weights do not have the same length.")
+    combined_total = sum(totals)
+    if combined_total <= max_vectors:
+        return totals
+
+    normalized_weights = [float(weight) for weight in weights]
+    samples = [
+        min(total, int(round(max_vectors * weight)))
+        for total, weight in zip(totals, normalized_weights)
+    ]
+    for index, total in enumerate(totals):
+        if total > 0 and samples[index] == 0:
+            samples[index] = 1
+
+    while sum(samples) > max_vectors:
+        candidate_indices = [
+            index for index, sample in enumerate(samples) if sample > 0
+        ]
+        if not candidate_indices:
+            break
+        reduce_index = max(
+            candidate_indices,
+            key=lambda index: (
+                samples[index] - max_vectors * normalized_weights[index],
+                samples[index],
+            ),
+        )
+        samples[reduce_index] -= 1
+
+    while sum(samples) < max_vectors:
+        candidate_indices = [
+            index
+            for index, total in enumerate(totals)
+            if samples[index] < total
+        ]
+        if not candidate_indices:
+            break
+        add_index = max(
+            candidate_indices,
+            key=lambda index: (
+                max_vectors * normalized_weights[index] - samples[index],
+                totals[index] - samples[index],
+            ),
+        )
+        samples[add_index] += 1
+
+    return samples
+
+
+def _sample_vectors_from_index(index, sample_size, rng):
+    sample_size = max(0, int(sample_size))
+    if sample_size == 0 or int(index.ntotal) == 0:
+        return np.empty((0, int(index.d)), dtype=np.float32)
+    if sample_size >= int(index.ntotal):
+        return np.asarray(index.reconstruct_n(0, int(index.ntotal)), dtype=np.float32)
+
+    index.make_direct_map()
+    sampled_ids = np.asarray(
+        rng.choice(int(index.ntotal), size=sample_size, replace=False),
+        dtype=np.int64,
+    )
+    return np.asarray(index.reconstruct_batch(sampled_ids), dtype=np.float32)
+
+
+def create_merged_feature_index(
+    model_names,
+    merged_model_name,
+    normalized_weights,
+    expected_dimension,
+):
+    index_metas = [
+        _load_merge_index_metadata(model_name, expected_dimension)
+        for model_name in model_names
+    ]
+    missing = [
+        model_name
+        for model_name, index_meta in zip(model_names, index_metas)
+        if index_meta is None
+    ]
+    if missing:
+        missing_list = ", ".join(missing)
+        return (
+            None,
+            f"Skipped merged index because no source index was found for: {missing_list}.",
+        )
+
+    sample_counts = _calculate_weighted_index_sample_counts(
+        [index_meta["ntotal"] for index_meta in index_metas],
+        normalized_weights,
+        MAX_MERGED_INDEX_VECTORS,
+    )
+    if sum(sample_counts) <= 0:
+        return (
+            None,
+            "Skipped merged index because the selected source indices do not contain vectors.",
+        )
+
+    rng = np.random.default_rng(114514)
+    vector_chunks = [
+        _sample_vectors_from_index(index_meta["index"], sample_count, rng)
+        for index_meta, sample_count in zip(index_metas, sample_counts)
+    ]
+    merged_vectors = np.concatenate(vector_chunks, axis=0).astype(
+        np.float32, copy=False
+    )
+    if merged_vectors.shape[0] == 0:
+        return (
+            None,
+            "Skipped merged index because no source vectors were available after sampling.",
+        )
+
+    rng.shuffle(merged_vectors, axis=0)
+    n_ivf = min(
+        int(16 * np.sqrt(merged_vectors.shape[0])),
+        max(1, merged_vectors.shape[0] // 39),
+    )
+    n_ivf = max(1, n_ivf)
+    merged_index = faiss.index_factory(
+        int(expected_dimension), f"IVF{n_ivf},Flat"
+    )
+    index_ivf = faiss.extract_index_ivf(merged_index)
+    index_ivf.nprobe = 1
+    merged_index.train(merged_vectors)
+    batch_size_add = 8192
+    for i in range(0, merged_vectors.shape[0], batch_size_add):
+        merged_index.add(merged_vectors[i : i + batch_size_add])
+
+    outside_index_dir = pathlib.Path(outside_index_root)
+    outside_index_dir.mkdir(parents=True, exist_ok=True)
+    merged_index_path = str(outside_index_dir / f"{merged_model_name}.index")
+    faiss.write_index(merged_index, merged_index_path)
+    sample_summary = ", ".join(
+        f"{sample_count} from {model_name}"
+        for model_name, sample_count in zip(model_names, sample_counts)
+    )
+    info = (
+        f"Created merged index '{merged_index_path}' using {sample_summary}."
+    )
+    return merged_index_path, info
+
+
+def _suggest_merged_voice_model_name(model_names):
+    normalized_names = [
+        _sanitize_output_fragment(model_name)
+        for model_name in _normalize_merge_model_selection(model_names)
+    ]
+    if len(normalized_names) < 2:
+        return ""
+    name_parts = normalized_names[:3]
+    if len(normalized_names) > 3:
+        name_parts.append(f"plus_{len(normalized_names) - 3}_more")
+    return "__".join(name_parts) + f"__mix_{len(normalized_names):02d}"
+
+
+def suggest_merged_voice_model_name(selected_models):
+    return _suggest_merged_voice_model_name(selected_models)
+
+
+def suggest_merged_voice_model_name_from_merge_inputs(base_model_name, selected_models):
+    return _suggest_merged_voice_model_name(
+        _build_full_merge_model_selection(base_model_name, selected_models)
+    )
+
+
+def _build_merged_voice_info(model_names, normalized_weights, custom_info):
+    custom_info = str(custom_info or "").strip()
+    if custom_info:
+        return custom_info
+    parts = [
+        f"{model_name} ({float(weight) * 100:.1f}%)"
+        for model_name, weight in zip(model_names, normalized_weights)
+    ]
+    return "Merged voice created from " + ", ".join(parts) + "."
+
+
+def refresh_merge_model_dropdowns(selected_models):
+    _refresh_model_name_cache()
+    available_models = _available_model_names()
+    selected_models = _normalize_merge_model_selection(selected_models)
+    filtered_selection = [
+        model_name for model_name in selected_models if model_name in available_models
+    ]
+    if len(filtered_selection) < 2 and len(available_models) >= 2:
+        filtered_selection = available_models[:2]
+    return gr.update(choices=available_models, value=filtered_selection)
+
+
+def _short_merge_compatibility_reason(reason):
+    reason = str(reason or "").strip()
+    if "sample rates" in reason:
+        return "sample rate mismatch"
+    if "pitch-guidance support" in reason:
+        return "pitch-guidance mismatch"
+    if "architecture versions" in reason:
+        return "architecture version mismatch"
+    if "parameter sets" in reason:
+        return "parameter set mismatch"
+    if "speaker embedding shapes" in reason:
+        return "speaker embedding shape mismatch"
+    if "tensor shapes" in reason:
+        return "tensor shape mismatch"
+    return reason or "incompatible"
+
+
+def _build_full_merge_model_selection(base_model_name, selected_models):
+    base_model_name = str(base_model_name or "").strip()
+    selected_models = _normalize_merge_model_selection(selected_models)
+    if base_model_name:
+        selected_models = [
+            model_name for model_name in selected_models if model_name != base_model_name
+        ]
+        return [base_model_name] + selected_models
+    return selected_models
+
+
+def _format_merge_compatibility_status(base_model_name, compatible_models, incompatible):
+    total_models = len(compatible_models) + len(incompatible)
+    additional_compatible = max(0, len(compatible_models) - (1 if base_model_name else 0))
+    if not base_model_name:
+        return "Select a base voice model to scan merge compatibility."
+    lines = [
+        f"Scanned {total_models} voice models against {base_model_name}.",
+        f"Base voice is included automatically: {base_model_name}",
+        f"Additional compatible voices: {additional_compatible}",
+        f"Filtered out: {len(incompatible)}",
+    ]
+    if incompatible:
+        reason_counts = Counter(
+            _short_merge_compatibility_reason(reason) for _, reason in incompatible
+        )
+        lines.append(
+            "Reason summary: "
+            + ", ".join(
+                f"{reason} x{count}" for reason, count in reason_counts.most_common(4)
+            )
+        )
+        preview_lines = [
+            f"{model_name}: {_short_merge_compatibility_reason(reason)}"
+            for model_name, reason in incompatible[:10]
+        ]
+        if preview_lines:
+            lines.append("Filtered examples:")
+            lines.extend(preview_lines)
+    else:
+        lines.append("All scanned models are compatible.")
+    return "\n".join(lines)
+
+
+def _format_incompatible_merge_voice_list(incompatible):
+    if not incompatible:
+        return "None."
+    return "\n".join(
+        f"{model_name}: {_short_merge_compatibility_reason(reason)}"
+        for model_name, reason in incompatible
+    )
+
+
+def _scan_merge_compatible_models(base_model_name, available_models=None, progress=None):
+    available_models = available_models or _available_model_names()
+    if not available_models:
+        return "", [], "No voice models were found in assets/weights."
+
+    base_model_name = str(base_model_name or "").strip()
+    if not base_model_name or base_model_name not in available_models:
+        base_model_name = available_models[0]
+
+    if progress is not None:
+        progress(0, desc=f"Scanning merge compatibility for {base_model_name}")
+
+    base_model = _load_cached_merge_model_metadata(base_model_name)
+    compatible_models = []
+    incompatible = []
+    total = max(1, len(available_models))
+    for index, candidate_name in enumerate(available_models, start=1):
+        if progress is not None:
+            progress(
+                index / total,
+                desc=f"Scanning {index}/{total}: {candidate_name}",
+            )
+        try:
+            candidate_model = _load_cached_merge_model_metadata(candidate_name)
+            _validate_mergeable_voice_models(base_model, candidate_model)
+            compatible_models.append(candidate_name)
+        except Exception as exc:
+            incompatible.append((candidate_name, str(exc)))
+
+    if base_model_name in compatible_models:
+        compatible_models = [base_model_name] + [
+            model_name for model_name in compatible_models if model_name != base_model_name
+        ]
+    else:
+        compatible_models.insert(0, base_model_name)
+    status = _format_merge_compatibility_status(
+        base_model_name,
+        compatible_models,
+        incompatible,
+    )
+    incompatible_text = _format_incompatible_merge_voice_list(incompatible)
+    return base_model_name, compatible_models, status, incompatible_text
+
+
+def _build_merge_scan_updates(
+    available_models,
+    base_model_name,
+    compatible_models,
+    selected_models,
+    status_text,
+):
+    selectable_compatible_models = [
+        model_name for model_name in compatible_models if model_name != base_model_name
+    ]
+    selected_models = _normalize_merge_model_selection(selected_models)
+    filtered_selection = [
+        model_name
+        for model_name in selected_models
+        if model_name in selectable_compatible_models
+    ]
+    suggested_name = _suggest_merged_voice_model_name(
+        _build_full_merge_model_selection(base_model_name, filtered_selection)
+    )
+    return (
+        gr.update(choices=available_models, value=base_model_name),
+        gr.update(choices=selectable_compatible_models, value=filtered_selection),
+        suggested_name,
+        status_text,
+    )
+
+
+def scan_merge_compatibility(base_model_name, selected_models, progress=gr.Progress(track_tqdm=False)):
+    available_models = _available_model_names()
+    (
+        base_model_name,
+        compatible_models,
+        status,
+        incompatible_text,
+    ) = _scan_merge_compatible_models(
+        base_model_name,
+        available_models=available_models,
+        progress=progress,
+    )
+    selected_models = _normalize_merge_model_selection(selected_models)
+    filtered_selection = [
+        model_name
+        for model_name in selected_models
+        if model_name in compatible_models and model_name != base_model_name
+    ]
+    selectable_compatible_models = [
+        model_name for model_name in compatible_models if model_name != base_model_name
+    ]
+    suggested_name = _suggest_merged_voice_model_name(
+        _build_full_merge_model_selection(base_model_name, filtered_selection)
+    )
+    return (
+        gr.update(choices=available_models, value=base_model_name),
+        gr.update(choices=selectable_compatible_models, value=filtered_selection),
+        suggested_name,
+        status,
+    )
+
+
+def stream_scan_merge_compatibility(base_model_name, selected_models):
+    available_models = _available_model_names()
+    if not available_models:
+        status_text = "No voice models were found in assets/weights."
+        yield _build_merge_scan_updates(
+            [],
+            "",
+            [],
+            [],
+            status_text,
+        )
+        return
+
+    base_model_name = str(base_model_name or "").strip()
+    if not base_model_name or base_model_name not in available_models:
+        base_model_name = available_models[0]
+
+    _emit_progress_line(f"Starting merge compatibility scan for {base_model_name}.")
+    base_model = _load_cached_merge_model_metadata(base_model_name)
+    compatible_models = [base_model_name]
+    incompatible = []
+    selected_models = _normalize_merge_model_selection(selected_models)
+    total = max(1, len(available_models))
+
+    initial_status = "\n".join(
+        [
+            f"Scanning {total} voice models against {base_model_name}...",
+            "Base voice is included automatically.",
+            "Finding additional compatible voices...",
+        ]
+    )
+    yield _build_merge_scan_updates(
+        available_models,
+        base_model_name,
+        compatible_models,
+        selected_models,
+        initial_status,
+    )
+
+    for index, candidate_name in enumerate(available_models, start=1):
+        if candidate_name == base_model_name:
+            status_lines = [
+                f"Scanning {index}/{total}: {candidate_name}",
+                f"Compatible so far: {max(0, len(compatible_models) - 1)} additional voices",
+                f"Filtered so far: {len(incompatible)}",
+            ]
+            _emit_progress_line(
+                f"Merge scan {index}/{total}: {candidate_name} -> base voice"
+            )
+            yield _build_merge_scan_updates(
+                available_models,
+                base_model_name,
+                compatible_models,
+                selected_models,
+                "\n".join(status_lines),
+            )
+            continue
+
+        try:
+            candidate_model = _load_cached_merge_model_metadata(candidate_name)
+            _validate_mergeable_voice_models(base_model, candidate_model)
+            compatible_models.append(candidate_name)
+            result_label = "compatible"
+        except Exception as exc:
+            incompatible.append((candidate_name, str(exc)))
+            result_label = _short_merge_compatibility_reason(exc)
+
+        status_lines = [
+            f"Scanning {index}/{total}: {candidate_name}",
+            f"Compatible so far: {max(0, len(compatible_models) - 1)} additional voices",
+            f"Filtered so far: {len(incompatible)}",
+        ]
+        _emit_progress_line(
+            f"Merge scan {index}/{total}: {candidate_name} -> {result_label}"
+        )
+        yield _build_merge_scan_updates(
+            available_models,
+            base_model_name,
+            compatible_models,
+            selected_models,
+            "\n".join(status_lines),
+        )
+
+    final_status = _format_merge_compatibility_status(
+        base_model_name,
+        compatible_models,
+        incompatible,
+    )
+    _emit_progress_line(
+        "Merge compatibility scan finished: "
+        f"{max(0, len(compatible_models) - 1)} additional compatible, "
+        f"{len(incompatible)} filtered."
+    )
+    yield _build_merge_scan_updates(
+        available_models,
+        base_model_name,
+        compatible_models,
+        selected_models,
+        final_status,
+    )
+
+
+def stream_refresh_merge_compatibility_inputs(base_model_name, selected_models):
+    _refresh_model_name_cache()
+    yield from stream_scan_merge_compatibility(base_model_name, selected_models)
+
+
+def refresh_merge_compatibility_inputs(base_model_name, selected_models, progress=gr.Progress(track_tqdm=False)):
+    available_models = _refresh_model_name_cache()
+    (
+        base_model_name,
+        compatible_models,
+        status,
+        _incompatible_text,
+    ) = _scan_merge_compatible_models(
+        base_model_name,
+        available_models=available_models,
+        progress=progress,
+    )
+    selected_models = _normalize_merge_model_selection(selected_models)
+    filtered_selection = [
+        model_name
+        for model_name in selected_models
+        if model_name in compatible_models and model_name != base_model_name
+    ]
+    selectable_compatible_models = [
+        model_name for model_name in compatible_models if model_name != base_model_name
+    ]
+    suggested_name = _suggest_merged_voice_model_name(
+        _build_full_merge_model_selection(base_model_name, filtered_selection)
+    )
+    return (
+        gr.update(choices=available_models, value=base_model_name),
+        gr.update(choices=selectable_compatible_models, value=filtered_selection),
+        suggested_name,
+        status,
+    )
 
 
 def _resolve_selected_index_path(file_index, file_index2):
@@ -798,6 +1602,17 @@ def get_vc_for_infer_ui(sid, protect0, protect1, file_index2, file_index4):
     ) = updates
     if isinstance(protect1_update, dict):
         protect1_update = {**protect1_update, "visible": False}
+    index_choices = _refresh_index_path_cache()
+    file_index2_update = _build_index_dropdown_update(
+        file_index2_update,
+        current_value=file_index2,
+        index_choices=index_choices,
+    )
+    file_index4_update = _build_index_dropdown_update(
+        file_index4_update,
+        current_value=file_index4,
+        index_choices=index_choices,
+    )
     return (
         speaker_update,
         protect0_update,
@@ -806,6 +1621,149 @@ def get_vc_for_infer_ui(sid, protect0, protect1, file_index2, file_index4):
         file_index4_update,
         model_info,
     )
+
+
+def create_merged_voice_model(
+    base_model_name,
+    selected_model_names,
+    merge_weight_text,
+    merged_model_name,
+    merged_model_info,
+    merge_source_indices,
+    protect0,
+    protect1,
+    file_index2,
+    file_index4,
+):
+    try:
+        selected_model_names = _build_full_merge_model_selection(
+            base_model_name,
+            selected_model_names,
+        )
+        if len(selected_model_names) < 2:
+            raise ValueError(
+                "Please select at least one compatible voice in addition to the base voice."
+            )
+        normalized_weights = _parse_merge_weights(
+            merge_weight_text,
+            len(selected_model_names),
+        )
+        merge_models = [
+            _load_cached_merge_model_metadata(model_name)
+            for model_name in selected_model_names
+        ]
+        _validate_mergeable_voice_model_group(merge_models)
+        reference_model = merge_models[0]
+
+        merged_model_name = _sanitize_output_fragment(
+            merged_model_name
+            or _suggest_merged_voice_model_name(selected_model_names)
+        )
+        merged_model_info = _build_merged_voice_info(
+            selected_model_names,
+            normalized_weights,
+            merged_model_info,
+        )
+        status_lines = []
+        merge_result = merge_many(
+            [model["path"] for model in merge_models],
+            normalized_weights,
+            reference_model["sr"],
+            i18n("Yes") if reference_model["f0"] else i18n("No"),
+            merged_model_info,
+            merged_model_name,
+            reference_model["version"],
+        )
+        if str(merge_result).strip() != "Success.":
+            raise RuntimeError(str(merge_result).strip() or "Voice merge failed.")
+        weight_summary = ", ".join(
+            f"{model_name} ({weight * 100:.1f}%)"
+            for model_name, weight in zip(selected_model_names, normalized_weights)
+        )
+        status_lines.append(
+            f"Created merged voice '{merged_model_name}.pth' from {weight_summary}."
+        )
+
+        if merge_source_indices:
+            expected_dimension = _expected_feature_dimension_for_version(
+                reference_model["version"]
+            )
+            _, index_status = create_merged_feature_index(
+                selected_model_names,
+                merged_model_name,
+                normalized_weights,
+                expected_dimension,
+            )
+            status_lines.append(index_status)
+        else:
+            status_lines.append("Skipped merged index because index merge was disabled.")
+
+        model_dropdown_choices = _refresh_model_name_cache()
+        _refresh_index_path_cache()
+        available_models = _available_model_names()
+        (
+            merge_base_model_value,
+            compatible_models,
+            compatibility_status,
+            _incompatible_text,
+        ) = _scan_merge_compatible_models(selected_model_names[0], available_models)
+        selectable_compatible_models = [
+            model_name
+            for model_name in compatible_models
+            if model_name != merge_base_model_value
+        ]
+        selected_additional_models = [
+            model_name
+            for model_name in selected_model_names
+            if model_name != merge_base_model_value
+        ]
+        merged_file_name = f"{merged_model_name}.pth"
+        (
+            speaker_update,
+            protect0_update,
+            protect1_update,
+            file_index2_update,
+            file_index4_update,
+            model_info,
+        ) = get_vc_for_infer_ui(
+            merged_file_name,
+            protect0,
+            protect1,
+            file_index2,
+            file_index4,
+        )
+        status_message = "\n".join(status_lines)
+        return (
+            status_message,
+            gr.update(choices=model_dropdown_choices, value=merged_file_name),
+            gr.update(choices=available_models, value=merge_base_model_value),
+            gr.update(
+                choices=selectable_compatible_models,
+                value=selected_additional_models,
+            ),
+            compatibility_status,
+            speaker_update,
+            protect0_update,
+            protect1_update,
+            file_index2_update,
+            file_index4_update,
+            model_info,
+        )
+    except Exception as exc:
+        logger.warning(traceback.format_exc())
+        return (
+            f"Could not create merged voice: {exc}",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
 
 
 def _normalize_audio_float(audio):
@@ -1414,20 +2372,31 @@ def save_infer_preset(preset_name, selected_preset_name, *values):
 
 
 def _build_loaded_infer_outputs(settings, preset_name, status_message):
+    available_index_paths = _refresh_index_path_cache()
     preset_name = _normalize_infer_preset_name(preset_name)
     sid_value = settings["sid0"]
     speaker_value = int(settings["spk_item"] or 0)
     protect0_value = float(settings["protect0"])
     protect1_value = float(settings["protect1"])
-    index_value_single = settings["file_index2"] if settings["file_index2"] in index_paths else ""
-    index_value_batch = settings["file_index4"] if settings["file_index4"] in index_paths else ""
+    index_value_single = (
+        settings["file_index2"] if settings["file_index2"] in available_index_paths else ""
+    )
+    index_value_batch = (
+        settings["file_index4"] if settings["file_index4"] in available_index_paths else ""
+    )
     model_info_value = ""
 
     spk_update = gr.update(value=speaker_value, visible=False)
     protect0_update = gr.update(value=protect0_value)
     protect1_update = gr.update(value=protect1_value, visible=False)
-    file_index2_update = gr.update(choices=sorted(index_paths), value=index_value_single)
-    file_index4_update = gr.update(choices=sorted(index_paths), value=index_value_batch)
+    file_index2_update = gr.update(
+        choices=available_index_paths,
+        value=index_value_single,
+    )
+    file_index4_update = gr.update(
+        choices=available_index_paths,
+        value=index_value_batch,
+    )
 
     if sid_value:
         try:
@@ -1468,12 +2437,20 @@ def _build_loaded_infer_outputs(settings, preset_name, status_message):
                 else file_index4_info.get("value", "")
             )
             file_index2_update = gr.update(
-                choices=sorted(index_paths),
-                value=file_index2_value if file_index2_value in index_paths or file_index2_value == "" else "",
+                choices=available_index_paths,
+                value=(
+                    file_index2_value
+                    if file_index2_value in available_index_paths or file_index2_value == ""
+                    else ""
+                ),
             )
             file_index4_update = gr.update(
-                choices=sorted(index_paths),
-                value=file_index4_value if file_index4_value in index_paths or file_index4_value == "" else "",
+                choices=available_index_paths,
+                value=(
+                    file_index4_value
+                    if file_index4_value in available_index_paths or file_index4_value == ""
+                    else ""
+                ),
             )
         except Exception:
             logger.warning(traceback.format_exc())
@@ -1602,6 +2579,28 @@ INITIAL_FILE_INDEX2 = INITIAL_INFER_PRESET["file_index2"]
 INITIAL_FILE_INDEX4 = INITIAL_INFER_PRESET["file_index4"]
 INITIAL_PROTECT0_VISIBLE = True
 INITIAL_PROTECT1_VISIBLE = False
+INITIAL_MERGE_MODEL_CHOICES = _available_model_names()
+INITIAL_MERGE_BASE_MODEL = (
+    INITIAL_INFER_PRESET["sid0"]
+    if INITIAL_INFER_PRESET["sid0"] in INITIAL_MERGE_MODEL_CHOICES
+    else (INITIAL_MERGE_MODEL_CHOICES[0] if INITIAL_MERGE_MODEL_CHOICES else "")
+)
+(
+    INITIAL_MERGE_BASE_MODEL,
+    INITIAL_MERGE_COMPATIBLE_CHOICES,
+    INITIAL_MERGE_COMPATIBILITY_STATUS,
+    _INITIAL_MERGE_INCOMPATIBLE_LIST,
+) = _scan_merge_compatible_models(INITIAL_MERGE_BASE_MODEL, INITIAL_MERGE_MODEL_CHOICES)
+INITIAL_MERGE_SELECTED_MODELS = (
+    []
+)
+INITIAL_MERGE_WEIGHT_TEXT = ""
+INITIAL_MERGED_MODEL_NAME = _suggest_merged_voice_model_name(
+    _build_full_merge_model_selection(
+        INITIAL_MERGE_BASE_MODEL,
+        INITIAL_MERGE_SELECTED_MODELS,
+    ),
+)
 
 if INITIAL_INFER_PRESET["sid0"]:
     try:
@@ -1635,19 +2634,6 @@ if INITIAL_INFER_PRESET["sid0"]:
         logger.warning(traceback.format_exc())
         INITIAL_INFER_PRESET["sid0"] = ""
         INITIAL_MODEL_INFO = ""
-
-
-def change_choices():
-    global index_paths, names
-    names = [""]
-    lookup_names(weight_root)
-    index_paths = [""]
-    lookup_indices(index_root)
-    lookup_indices(outside_index_root)
-    return {"choices": sorted(names), "__type__": "update"}, {
-        "choices": sorted(index_paths),
-        "__type__": "update",
-    }
 
 
 def clean():
@@ -2363,6 +3349,85 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                         label=i18n("Preset status"),
                         value="",
                     )
+            with gr.Accordion(i18n("Create merged voice"), open=False):
+                gr.Markdown(
+                    value=i18n(
+                        "Pick two or more installed voice models to create a weighted merged voice in the weights folder. Leave weights blank for an equal mix. The new voice is loaded automatically after it is created."
+                    )
+                )
+                with gr.Row():
+                    merge_base_model = gr.Dropdown(
+                        label=i18n("Compatibility base voice"),
+                        choices=INITIAL_MERGE_MODEL_CHOICES,
+                        value=INITIAL_MERGE_BASE_MODEL,
+                        interactive=True,
+                        info=i18n(
+                            "Selecting a base voice scans all installed models and filters this list to compatible merge candidates."
+                        ),
+                    )
+                with gr.Row():
+                    merge_model_names = gr.Dropdown(
+                        label=i18n("Additional compatible voices to merge"),
+                        choices=[
+                            model_name
+                            for model_name in INITIAL_MERGE_COMPATIBLE_CHOICES
+                            if model_name != INITIAL_MERGE_BASE_MODEL
+                        ],
+                        value=INITIAL_MERGE_SELECTED_MODELS,
+                        multiselect=True,
+                        interactive=True,
+                        info=i18n(
+                            "The base voice is always included automatically. This list only shows additional compatible voices."
+                        ),
+                    )
+                with gr.Row():
+                    merge_model_weights = gr.Textbox(
+                        label=i18n("Weights (optional, comma-separated)"),
+                        value=INITIAL_MERGE_WEIGHT_TEXT,
+                        interactive=True,
+                        info=i18n(
+                            "Match the selected voice order. Example: 0.5, 0.3, 0.2 or 50%, 30%, 20%."
+                        ),
+                    )
+                    merged_model_name = gr.Textbox(
+                        label=i18n("Merged voice name (without extension)"),
+                        value=INITIAL_MERGED_MODEL_NAME,
+                        interactive=True,
+                    )
+                with gr.Row():
+                    gr.Markdown(
+                        value=i18n(
+                            "Tip: repeated merges are supported, so you can still build larger blends by merging a previous merged voice with more voices later."
+                        )
+                    )
+                merge_compatibility_status = gr.Textbox(
+                    label=i18n("Compatibility scan status"),
+                    value=INITIAL_MERGE_COMPATIBILITY_STATUS,
+                    max_lines=12,
+                    interactive=False,
+                )
+                merged_model_info = gr.Textbox(
+                    label=i18n("Merged voice notes (optional)"),
+                    value="",
+                    max_lines=4,
+                    interactive=True,
+                )
+                merge_source_indices = gr.Checkbox(
+                    label=i18n("Also create merged index"),
+                    value=True,
+                    interactive=True,
+                    info=i18n(
+                        "Builds a new FAISS index from both source voice indexes when they are available."
+                    ),
+                )
+                merge_voice_button = gr.Button(
+                    i18n("Create merged voice"),
+                    variant="primary",
+                )
+                merge_voice_status = gr.Textbox(
+                    label=i18n("Merged voice status"),
+                    value="",
+                )
             with gr.TabItem(i18n("Single inference")):
                 with gr.Row():
                     with gr.Column():
@@ -2468,8 +3533,8 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                         )
 
                         refresh_button.click(
-                            fn=change_choices,
-                            inputs=[],
+                            fn=refresh_infer_model_and_index_choices,
+                            inputs=[sid0, file_index2],
                             outputs=[sid0, file_index2],
                             api_name="infer_refresh",
                         )
@@ -2557,8 +3622,8 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                         )
 
                         refresh_button.click(
-                            fn=lambda: change_choices()[1],
-                            inputs=[],
+                            fn=refresh_batch_index_choices,
+                            inputs=[file_index4],
                             outputs=file_index4,
                             api_name="infer_refresh_batch",
                         )
@@ -2675,6 +3740,68 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                     fn=open_outputs_folder,
                     inputs=[],
                     outputs=[],
+                )
+                merge_base_model.change(
+                    fn=stream_scan_merge_compatibility,
+                    inputs=[merge_base_model, merge_model_names],
+                    outputs=[
+                        merge_base_model,
+                        merge_model_names,
+                        merged_model_name,
+                        merge_compatibility_status,
+                    ],
+                    api_name="infer_scan_merge_compatibility",
+                    show_progress="hidden",
+                    trigger_mode="always_last",
+                )
+                merge_model_names.change(
+                    fn=suggest_merged_voice_model_name_from_merge_inputs,
+                    inputs=[merge_base_model, merge_model_names],
+                    outputs=[merged_model_name],
+                    show_progress="hidden",
+                    queue=False,
+                    trigger_mode="always_last",
+                )
+                refresh_button.click(
+                    fn=stream_refresh_merge_compatibility_inputs,
+                    inputs=[merge_base_model, merge_model_names],
+                    outputs=[
+                        merge_base_model,
+                        merge_model_names,
+                        merged_model_name,
+                        merge_compatibility_status,
+                    ],
+                    api_name="infer_refresh_merge_voices",
+                    show_progress="hidden",
+                )
+                merge_voice_button.click(
+                    fn=create_merged_voice_model,
+                    inputs=[
+                        merge_base_model,
+                        merge_model_names,
+                        merge_model_weights,
+                        merged_model_name,
+                        merged_model_info,
+                        merge_source_indices,
+                        protect0,
+                        protect1,
+                        file_index2,
+                        file_index4,
+                    ],
+                    outputs=[
+                        merge_voice_status,
+                        sid0,
+                        merge_base_model,
+                        merge_model_names,
+                        merge_compatibility_status,
+                        spk_item,
+                        protect0,
+                        protect1,
+                        file_index2,
+                        file_index4,
+                        modelinfo,
+                    ],
+                    api_name="infer_merge_voice",
                 )
                 sid0.change(
                     fn=get_vc_for_infer_ui,
@@ -3335,37 +4462,42 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
             except:
                 gr.Markdown(traceback.format_exc())
 
-try:
-    import signal
+def main():
+    try:
+        import signal
 
-    def cleanup(signum, frame):
-        signame = signal.Signals(signum).name
-        print(f"Got signal {signame} ({signum})")
-        app.close()
-        sys.exit(0)
+        def cleanup(signum, frame):
+            signame = signal.Signals(signum).name
+            print(f"Got signal {signame} ({signum})")
+            app.close()
+            sys.exit(0)
 
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-    if config.listen_host is None:
-        os.environ.pop("GRADIO_SERVER_NAME", None)
-    if config.listen_port is None:
-        os.environ.pop("GRADIO_SERVER_PORT", None)
-    launch_kwargs = {
-        "max_threads": 511,
-        "inbrowser": not config.noautoopen,
-        "quiet": True,
-    }
-    if config.global_link:
-        launch_kwargs["share"] = True
-    if config.listen_host:
-        launch_kwargs["server_name"] = config.listen_host
-    if config.listen_port is not None:
-        launch_kwargs["server_port"] = config.listen_port
-    app = app.queue(max_size=1022)
-    _, local_url, share_url = app.launch(
-        prevent_thread_lock=True, **launch_kwargs
-    )
-    _print_gradio_startup_urls(local_url, share_url)
-    app.block_thread()
-except Exception as e:
-    logger.error(str(e))
+        signal.signal(signal.SIGINT, cleanup)
+        signal.signal(signal.SIGTERM, cleanup)
+        if config.listen_host is None:
+            os.environ.pop("GRADIO_SERVER_NAME", None)
+        if config.listen_port is None:
+            os.environ.pop("GRADIO_SERVER_PORT", None)
+        launch_kwargs = {
+            "max_threads": 511,
+            "inbrowser": not config.noautoopen,
+            "quiet": True,
+        }
+        if config.global_link:
+            launch_kwargs["share"] = True
+        if config.listen_host:
+            launch_kwargs["server_name"] = config.listen_host
+        if config.listen_port is not None:
+            launch_kwargs["server_port"] = config.listen_port
+        queued_app = app.queue(max_size=1022)
+        _, local_url, share_url = queued_app.launch(
+            prevent_thread_lock=True, **launch_kwargs
+        )
+        _print_gradio_startup_urls(local_url, share_url)
+        queued_app.block_thread()
+    except Exception as e:
+        logger.error(str(e))
+
+
+if __name__ == "__main__":
+    main()

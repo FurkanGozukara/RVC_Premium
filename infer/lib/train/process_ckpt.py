@@ -206,9 +206,8 @@ def change_info(path, info, name):
         return traceback.format_exc()
 
 
-def merge(path1, path2, alpha1, sr, f0, info, name, version):
+def merge_many(paths, weights, sr, f0, info, name, version):
     try:
-
         def extract(ckpt):
             a = ckpt["model"]
             opt = OrderedDict()
@@ -219,56 +218,90 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
                 opt["weight"][key] = a[key]
             return opt
 
-        def authors(c1, c2):
-            a1, a2 = c1.get("author", ""), c2.get("author", "")
-            if a1 == a2:
-                return a1
-            if not a1:
-                a1 = "Unknown"
-            if not a2:
-                a2 = "Unknown"
-            return f"{a1} & {a2}"
+        def authors(ckpts):
+            all_authors = []
+            for ckpt in ckpts:
+                author = ckpt.get("author", "") or "Unknown"
+                if author not in all_authors:
+                    all_authors.append(author)
+            if not all_authors:
+                return ""
+            return " & ".join(all_authors)
 
-        ckpt1 = torch.load(path1, map_location="cpu")
-        ckpt2 = torch.load(path2, map_location="cpu")
-        cfg = ckpt1["config"]
-        if "model" in ckpt1:
-            ckpt1 = extract(ckpt1)
-        else:
-            ckpt1 = ckpt1["weight"]
-        if "model" in ckpt2:
-            ckpt2 = extract(ckpt2)
-        else:
-            ckpt2 = ckpt2["weight"]
-        if sorted(list(ckpt1.keys())) != sorted(list(ckpt2.keys())):
-            return "Fail to merge the models. The model architectures are not the same."
+        if len(paths) < 2:
+            return "Fail to merge the models. Please provide at least two models."
+        if len(paths) != len(weights):
+            return "Fail to merge the models. The number of weights does not match the number of models."
+
+        normalized_weights = [float(weight) for weight in weights]
+        if any(weight < 0 for weight in normalized_weights):
+            return "Fail to merge the models. Weights must be non-negative."
+        total_weight = sum(normalized_weights)
+        if total_weight <= 0:
+            return "Fail to merge the models. The total weight must be greater than zero."
+        normalized_weights = [weight / total_weight for weight in normalized_weights]
+
+        loaded_ckpts = [torch.load(path, map_location="cpu") for path in paths]
+        cfg = loaded_ckpts[0]["config"]
+        model_weights = []
+        for ckpt in loaded_ckpts:
+            if "model" in ckpt:
+                model_weights.append(extract(ckpt)["weight"])
+            else:
+                model_weights.append(ckpt["weight"])
+        reference_keys = sorted(list(model_weights[0].keys()))
+        for current in model_weights[1:]:
+            if sorted(list(current.keys())) != reference_keys:
+                return "Fail to merge the models. The model architectures are not the same."
         opt = OrderedDict()
         opt["weight"] = {}
-        for key in ckpt1.keys():
-            # try:
-            if key == "emb_g.weight" and ckpt1[key].shape != ckpt2[key].shape:
-                min_shape0 = min(ckpt1[key].shape[0], ckpt2[key].shape[0])
-                opt["weight"][key] = (
-                    alpha1 * (ckpt1[key][:min_shape0].float())
-                    + (1 - alpha1) * (ckpt2[key][:min_shape0].float())
-                ).half()
+        for key in reference_keys:
+            key_shapes = [tuple(current[key].shape) for current in model_weights]
+            if key == "emb_g.weight" and len(set(key_shapes)) > 1:
+                trailing_shapes = {shape[1:] for shape in key_shapes}
+                if len(trailing_shapes) != 1:
+                    return (
+                        "Fail to merge the models. The speaker embedding shapes are not "
+                        f"compatible for '{key}': {key_shapes}."
+                    )
+                min_shape0 = min(shape[0] for shape in key_shapes)
+                merged_weight = None
+                for index, current in enumerate(model_weights):
+                    contribution = (
+                        normalized_weights[index] * current[key][:min_shape0].float()
+                    )
+                    merged_weight = (
+                        contribution
+                        if merged_weight is None
+                        else merged_weight + contribution
+                    )
+                opt["weight"][key] = merged_weight.half()
             else:
-                opt["weight"][key] = (
-                    alpha1 * (ckpt1[key].float()) + (1 - alpha1) * (ckpt2[key].float())
-                ).half()
-        author = authors(ckpt1, ckpt2)
+                if len(set(key_shapes)) != 1:
+                    return (
+                        "Fail to merge the models. Parameter "
+                        f"'{key}' has different tensor shapes: {key_shapes}."
+                    )
+                merged_weight = None
+                for index, current in enumerate(model_weights):
+                    contribution = normalized_weights[index] * current[key].float()
+                    merged_weight = (
+                        contribution
+                        if merged_weight is None
+                        else merged_weight + contribution
+                    )
+                opt["weight"][key] = merged_weight.half()
+        author = authors(loaded_ckpts)
         opt["config"] = cfg
-        """
-        if(sr=="40k"):opt["config"] = [1025, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]], [10, 10, 2, 2], 512, [16, 16, 4, 4,4], 109, 256, 40000]
-        elif(sr=="48k"):opt["config"] = [1025, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]], [10,6,2,2,2], 512, [16, 16, 4, 4], 109, 256, 48000]
-        elif(sr=="32k"):opt["config"] = [513, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]], [10, 4, 2, 2, 2], 512, [16, 16, 4, 4,4], 109, 256, 32000]
-        """
         opt["name"] = name
         opt["timestamp"] = int(time())
         if author:
             opt["author"] = author
         opt["sr"] = sr
-        opt["f0"] = 1 if f0 == i18n("Yes") else 0
+        if isinstance(f0, str):
+            opt["f0"] = 1 if f0 == i18n("Yes") else 0
+        else:
+            opt["f0"] = 1 if f0 else 0
         opt["version"] = version
         opt["info"] = info
         h = model_hash_ckpt(opt)
@@ -278,3 +311,15 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         return "Success."
     except:
         return traceback.format_exc()
+
+
+def merge(path1, path2, alpha1, sr, f0, info, name, version):
+    return merge_many(
+        [path1, path2],
+        [float(alpha1), 1 - float(alpha1)],
+        sr,
+        f0,
+        info,
+        name,
+        version,
+    )
