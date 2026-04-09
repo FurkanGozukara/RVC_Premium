@@ -3238,8 +3238,75 @@ theme = gr.themes.Ocean(
     button_primary_text_color="white",
 )
 
-with gr.Blocks(title="RVC WebUI", theme=theme) as app:
-    gr.Markdown("## SECourses Premium RVC WebUI V2.0 : https://www.patreon.com/posts/149104996")
+MERGE_VOICE_CSS = """
+#merge-voice-accordion {
+    border-radius: 24px;
+    overflow: visible;
+}
+
+#merge-voice-accordion .label-wrap {
+    align-items: center;
+    padding: 16px 18px;
+    border: none;
+    border-radius: 22px;
+    background: linear-gradient(135deg, #7f1d1d 0%, #b91c1c 45%, #e11d48 100%);
+    color: #fff;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.18),
+        0 18px 34px -24px rgba(127, 29, 29, 0.88);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+
+#merge-voice-accordion .label-wrap:hover {
+    transform: translateY(-1px);
+    filter: saturate(1.05);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.18),
+        0 22px 38px -24px rgba(127, 29, 29, 0.95);
+}
+
+#merge-voice-accordion .label-wrap span,
+#merge-voice-accordion .label-wrap .icon {
+    color: inherit;
+}
+
+#merge-voice-accordion > div:last-child {
+    padding-top: 8px;
+}
+
+#merge-voice-accordion .merge-voice-action.primary {
+    min-height: 50px;
+    border: 1px solid rgba(127, 29, 29, 0.34);
+    border-radius: 999px;
+    background: linear-gradient(135deg, #991b1b 0%, #dc2626 48%, #fb7185 100%);
+    color: #fff;
+    box-shadow: 0 22px 34px -24px rgba(190, 24, 93, 0.9);
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+
+#merge-voice-accordion .merge-voice-action.primary:hover {
+    transform: translateY(-1px);
+    filter: brightness(1.03);
+    box-shadow: 0 28px 42px -24px rgba(190, 24, 93, 1);
+}
+
+#merge-voice-accordion .merge-voice-action.primary:focus-visible {
+    box-shadow:
+        0 0 0 3px rgba(251, 113, 133, 0.25),
+        0 28px 42px -24px rgba(190, 24, 93, 1);
+}
+
+body.dark #merge-voice-accordion,
+.dark #merge-voice-accordion {
+    background: transparent;
+    box-shadow: none;
+}
+"""
+
+with gr.Blocks(title="RVC WebUI", theme=theme, css=MERGE_VOICE_CSS) as app:
+    gr.Markdown("## SECourses Premium RVC WebUI V3.0 : https://www.patreon.com/posts/149104996")
     gr.Markdown("### Pre-Trained Voices Download 1 : https://huggingface.co/QuickWick/Music-AI-Voices/tree/main")
     gr.Markdown("### Pre-Trained Voices Download 2 : https://huggingface.co/Coolwowsocoolwow")
     gr.Markdown(
@@ -3349,7 +3416,11 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                         label=i18n("Preset status"),
                         value="",
                     )
-            with gr.Accordion(i18n("Create merged voice"), open=False):
+            with gr.Accordion(
+                i18n("Make Merged Voice"),
+                open=False,
+                elem_id="merge-voice-accordion",
+            ):
                 gr.Markdown(
                     value=i18n(
                         "Pick two or more installed voice models to create a weighted merged voice in the weights folder. Leave weights blank for an equal mix. The new voice is loaded automatically after it is created."
@@ -3421,8 +3492,9 @@ with gr.Blocks(title="RVC WebUI", theme=theme) as app:
                     ),
                 )
                 merge_voice_button = gr.Button(
-                    i18n("Create merged voice"),
+                    i18n("Compose Merged Voice"),
                     variant="primary",
+                    elem_classes=["merge-voice-action"],
                 )
                 merge_voice_status = gr.Textbox(
                     label=i18n("Merged voice status"),
