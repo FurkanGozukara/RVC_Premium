@@ -3,16 +3,22 @@ import sys
 import logging
 from typing import Tuple
 
+from dotenv import load_dotenv
+
 logger = logging.getLogger(__name__)
 logging.getLogger("numba").setLevel(logging.WARNING)
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
+load_dotenv()
+load_dotenv("sha256.env")
 
 import datetime
 
+from configs import Config
 from infer.lib.train import utils
 
+Config.use_insecure_load()
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
@@ -98,7 +104,8 @@ class EpochRecorder:
 
 
 def main():
-    n_gpus = torch.cuda.device_count()
+    requested_gpus = [gpu for gpu in hps.gpus.split("-") if gpu != ""]
+    n_gpus = len(requested_gpus) if requested_gpus else torch.cuda.device_count()
 
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
         n_gpus = 1
@@ -124,31 +131,37 @@ def main():
 
 def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     global global_step
+    use_ddp = n_gpus > 1
     if rank == 0:
-        # logger = utils.get_logger(hps.model_dir)
+        logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
         # utils.check_git_hash(hps.model_dir)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-    try:
-        dist.init_process_group(
-            backend=(
-                "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
-            ),
-            init_method="env://",
-            world_size=n_gpus,
-            rank=rank,
-        )
-    except:
-        dist.init_process_group(
-            backend=(
-                "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
-            ),
-            init_method="env://?use_libuv=False",
-            world_size=n_gpus,
-            rank=rank,
-        )
+    if use_ddp:
+        try:
+            dist.init_process_group(
+                backend=(
+                    "gloo"
+                    if os.name == "nt" or not torch.cuda.is_available()
+                    else "nccl"
+                ),
+                init_method="env://",
+                world_size=n_gpus,
+                rank=rank,
+            )
+        except:
+            dist.init_process_group(
+                backend=(
+                    "gloo"
+                    if os.name == "nt" or not torch.cuda.is_available()
+                    else "nccl"
+                ),
+                init_method="env://?use_libuv=False",
+                world_size=n_gpus,
+                rank=rank,
+            )
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -221,14 +234,15 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     )
     # net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
     # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        pass
-    elif torch.cuda.is_available():
-        net_g = DDP(net_g, device_ids=[rank])
-        net_d = DDP(net_d, device_ids=[rank])
-    else:
-        net_g = DDP(net_g)
-        net_d = DDP(net_d)
+    if use_ddp:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            pass
+        elif torch.cuda.is_available():
+            net_g = DDP(net_g, device_ids=[rank])
+            net_d = DDP(net_d, device_ids=[rank])
+        else:
+            net_g = DDP(net_g)
+            net_d = DDP(net_d)
 
     try:  # 如果能加载自动resume
         _, _, _, epoch_str = utils.load_checkpoint(
@@ -667,6 +681,7 @@ def train_and_evaluate(
             )
         )
         sleep(1)
+        logging.shutdown()
         os._exit(0)
 
 

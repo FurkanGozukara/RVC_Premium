@@ -2768,9 +2768,12 @@ def extract_f0_feature(n_p, f0method, if_f0, exp_dir, version19):
     exp_dir=sys.argv[4]
     os.environ["CUDA_VISIBLE_DEVICES"]=str(i_gpu)
     """
-    leng = len(gpus)
+    gpu_list = [gpu for gpu in gpus.split("-") if gpu]
+    if not gpu_list:
+        gpu_list = ["0"] if torch.cuda.is_available() else [config.device]
+    leng = len(gpu_list)
     ps = []
-    for idx, n_g in enumerate(gpus):
+    for idx, n_g in enumerate(gpu_list):
         cmd = (
             '"%s" infer/modules/train/extract_feature_print.py %s %s %s %s "%s/logs/%s" %s %s'
             % (
@@ -3306,7 +3309,7 @@ body.dark #merge-voice-accordion,
 """
 
 with gr.Blocks(title="RVC WebUI", theme=theme, css=MERGE_VOICE_CSS) as app:
-    gr.Markdown("## SECourses Premium RVC WebUI V5.0 : https://www.patreon.com/posts/149104996")
+    gr.Markdown("## SECourses Premium RVC WebUI V5.1 : https://www.patreon.com/posts/149104996")
     gr.Markdown("### Pre-Trained Voices Download 1 : https://huggingface.co/QuickWick/Music-AI-Voices/tree/main")
     gr.Markdown("### Pre-Trained Voices Download 2 : https://huggingface.co/Coolwowsocoolwow")
     gr.Markdown(
