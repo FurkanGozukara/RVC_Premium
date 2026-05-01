@@ -3309,7 +3309,7 @@ body.dark #merge-voice-accordion,
 """
 
 with gr.Blocks(title="RVC WebUI", theme=theme, css=MERGE_VOICE_CSS) as app:
-    gr.Markdown("## SECourses Premium RVC WebUI V5.1 : https://www.patreon.com/posts/149104996")
+    gr.Markdown("## SECourses Premium RVC WebUI V6 : https://www.patreon.com/posts/149104996")
     gr.Markdown("### Pre-Trained Voices Download 1 : https://huggingface.co/QuickWick/Music-AI-Voices/tree/main")
     gr.Markdown("### Pre-Trained Voices Download 2 : https://huggingface.co/Coolwowsocoolwow")
     gr.Markdown(
